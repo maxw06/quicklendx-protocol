@@ -125,7 +125,7 @@ impl InvoiceSearch {
     }
 
     /// Check if text contains query as substring (case-insensitive)
-    fn contains_substring(text: &String, query: &String) -> bool {
+    pub(crate) fn contains_substring(text: &String, query: &String) -> bool {
         let text_lower = Self::to_lowercase(text);
         let query_lower = Self::to_lowercase(query);
 
@@ -154,7 +154,7 @@ impl InvoiceSearch {
     }
 
     /// Convert string to lowercase
-    fn to_lowercase(s: &String) -> String {
+    pub(crate) fn to_lowercase(s: &String) -> String {
         let mut result_bytes = alloc::vec::Vec::new();
         for byte in s.to_bytes().iter() {
             if byte.is_ascii_uppercase() {
@@ -253,6 +253,10 @@ impl InvoiceSearch {
         }
     }
 }
+
+#[cfg(all(test, feature = "fuzz-tests"))]
+#[path = "test_fuzz_search_text.rs"]
+mod test_fuzz_search_text;
 
 #[cfg(test)]
 mod tests {
