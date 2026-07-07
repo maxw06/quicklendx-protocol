@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+import { perKeyRateLimitMiddleware } from "./rate-limit";
 
 export interface AuthenticatedRequest extends Request {
   actor?: string;
@@ -28,7 +29,8 @@ export function apiKeyAuth(
 ): void {
   if (process.env.SKIP_API_KEY_AUTH === "true") {
     req.actor = process.env.TEST_ACTOR || "test-actor";
-    next();
+    (req as any).rateLimitKey = req.actor;
+    perKeyRateLimitMiddleware(req, res, next);
     return;
   }
 
@@ -59,7 +61,8 @@ export function apiKeyAuth(
   }
 
   req.actor = actor;
-  next();
+  (req as any).rateLimitKey = actor;
+  perKeyRateLimitMiddleware(req, res, next);
 }
 
 export function resetApiKeys(): void {

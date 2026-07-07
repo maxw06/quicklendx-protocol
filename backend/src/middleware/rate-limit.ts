@@ -20,10 +20,78 @@ export interface RateLimitPolicySnapshot {
   headers: string[];
 }
 
+export interface RateLimitConsumeResult {
+  remainingPoints: number;
+  msBeforeNext: number;
+  consumedPoints?: number;
+  isFirstInDuration?: boolean;
+}
+
+export interface RateLimiterLike {
+  points: number;
+  consume(key: string): Promise<RateLimitConsumeResult>;
+  delete(key: string): boolean | Promise<boolean>;
+}
+
+export interface SlidingWindowRateLimiterOptions {
+  points: number;
+  duration: number;
+  blockDuration?: number;
+  clock?: () => number;
+}
+
+export class SlidingWindowRateLimiter implements RateLimiterLike {
+  public readonly points: number;
+  public readonly duration: number;
+  public readonly blockDuration: number;
+  private readonly clock: () => number;
+  private readonly buckets = new Map<string, number[]>();
+
+  constructor(options: SlidingWindowRateLimiterOptions) {
+    this.points = options.points;
+    this.duration = options.duration;
+    this.blockDuration = options.blockDuration ?? 0;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  async consume(key: string): Promise<RateLimitConsumeResult> {
+    const now = this.clock();
+    const windowMs = this.duration * 1000;
+    const cutoff = now - windowMs;
+    const bucket = (this.buckets.get(key) ?? []).filter((timestamp) => timestamp > cutoff);
+
+    if (bucket.length >= this.points) {
+      const msBeforeNext = Math.max(1, bucket[0] + windowMs - now);
+      this.buckets.set(key, bucket);
+      throw {
+        remainingPoints: 0,
+        msBeforeNext,
+        consumedPoints: bucket.length + 1,
+        isFirstInDuration: false,
+      };
+    }
+
+    bucket.push(now);
+    this.buckets.set(key, bucket);
+
+    return {
+      remainingPoints: this.points - bucket.length,
+      msBeforeNext: Math.max(1, bucket[0] + windowMs - now),
+      consumedPoints: bucket.length,
+      isFirstInDuration: bucket.length === 1,
+    };
+  }
+
+  delete(key: string): boolean {
+    return this.buckets.delete(key);
+  }
+}
+
 const RATE_LIMIT_HEADERS = [
   "X-RateLimit-Limit",
   "X-RateLimit-Remaining",
   "X-RateLimit-Reset",
+  "X-RateLimit-Policy",
 ];
 
 const readPositiveInt = (
@@ -51,7 +119,7 @@ export const RATE_LIMIT_POLICIES: Record<RateLimitPolicyId, RateLimitPolicySnaps
     scope: "all API endpoints after authentication context is available",
     limit: readPositiveInt("RATE_LIMIT_PER_KEY_POINTS", 60, 1000),
     windowSeconds: 60,
-    blockSeconds: 60,
+    blockSeconds: 0,
     key: "api-key-or-client-ip",
     headers: RATE_LIMIT_HEADERS,
   },
@@ -112,7 +180,7 @@ export const rateLimiter = new RateLimiterMemory({
  * Per-API-key rate limiter
  * Applies a separate bucket for each authenticated API key.
  */
-export const perKeyRateLimiter = new RateLimiterMemory({
+export const perKeyRateLimiter = new SlidingWindowRateLimiter({
   points: RATE_LIMIT_POLICIES.perKey.limit,
   duration: RATE_LIMIT_POLICIES.perKey.windowSeconds,
   blockDuration: RATE_LIMIT_POLICIES.perKey.blockSeconds,
@@ -139,10 +207,41 @@ export const exportRateLimiter = new RateLimiterMemory({
 /**
  * Set rate limit headers on response
  */
-const setRateLimitHeaders = (res: Response, rateLimiterRes: RateLimiterRes) => {
-  res.setHeader("X-RateLimit-Limit", rateLimiter.points);
+const isRateLimitRejection = (value: unknown): value is RateLimitConsumeResult => {
+  if (value instanceof RateLimiterRes) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<RateLimitConsumeResult>;
+  return typeof candidate.msBeforeNext === "number" && typeof candidate.remainingPoints === "number";
+};
+
+const getClientKey = (req: Request): string => {
+  return String(req.ip || req.headers["x-forwarded-for"] || "unknown");
+};
+
+const getAuthenticatedRateLimitKey = (req: Request): string | null => {
+  const apiKeyId = (req as any).apiKey?.id;
+  if (typeof apiKeyId === "string" && apiKeyId.trim().length > 0) {
+    return `api-key:${apiKeyId}`;
+  }
+
+  const rateLimitKey = (req as any).rateLimitKey;
+  if (typeof rateLimitKey === "string" && rateLimitKey.trim().length > 0) {
+    return `api-key:${rateLimitKey}`;
+  }
+
+  return null;
+};
+
+const setRateLimitHeaders = (
+  res: Response,
+  limiter: { points: number },
+  rateLimiterRes: RateLimitConsumeResult,
+  policyId: RateLimitPolicyId
+) => {
+  res.setHeader("X-RateLimit-Limit", limiter.points);
   res.setHeader("X-RateLimit-Remaining", rateLimiterRes.remainingPoints);
   res.setHeader("X-RateLimit-Reset", new Date(Date.now() + rateLimiterRes.msBeforeNext).toISOString());
+  res.setHeader("X-RateLimit-Policy", policyId);
 };
 
 /**
@@ -156,15 +255,15 @@ export const rateLimitMiddleware = async (
   res: Response,
   next: NextFunction
 ) => {
-  const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const ip = getClientKey(req);
   
   try {
     const rateLimiterRes = await rateLimiter.consume(String(ip));
-    setRateLimitHeaders(res, rateLimiterRes);
+    setRateLimitHeaders(res, rateLimiter, rateLimiterRes, "global");
     next();
   } catch (rejRes) {
-    if (rejRes instanceof RateLimiterRes) {
-      setRateLimitHeaders(res, rejRes);
+    if (isRateLimitRejection(rejRes)) {
+      setRateLimitHeaders(res, rateLimiter, rejRes, "global");
       res.setHeader("Retry-After", Math.ceil(rejRes.msBeforeNext / 1000));
       res.status(429).json({
         error: {
@@ -191,15 +290,14 @@ export const rateLimitMiddleware = async (
  */
 export const createRateLimitMiddleware = (customLimiter: RateLimiterMemory) => {
   return async (req: Request, res: Response, next: NextFunction) => {
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const ip = getClientKey(req);
     try {
       const rateLimiterRes = await customLimiter.consume(String(ip));
-      res.setHeader("X-RateLimit-Limit", customLimiter.points);
-      res.setHeader("X-RateLimit-Remaining", rateLimiterRes.remainingPoints);
-      res.setHeader("X-RateLimit-Reset", new Date(Date.now() + rateLimiterRes.msBeforeNext).toISOString());
+      setRateLimitHeaders(res, customLimiter, rateLimiterRes, "strict");
       next();
     } catch (rejRes) {
-      if (rejRes instanceof RateLimiterRes) {
+      if (isRateLimitRejection(rejRes)) {
+        setRateLimitHeaders(res, customLimiter, rejRes, "strict");
         res.setHeader("Retry-After", Math.ceil(rejRes.msBeforeNext / 1000));
         res.status(429).json({
           error: {
@@ -216,23 +314,34 @@ export const createRateLimitMiddleware = (customLimiter: RateLimiterMemory) => {
 };
 
 /**
- * Factory to create rate limiters keyed on API key id when available,
- * falling back to client IP for unauthenticated requests.
+ * Factory to create rate limiters keyed on API key id when available.
+ * The general per-key limiter skips anonymous traffic so the global IP limiter
+ * remains the only anonymous bound. Route-specific limiters may opt into an IP
+ * fallback for unauthenticated, signed-token style endpoints.
  */
-export const createKeyedRateLimitMiddleware = (customLimiter: RateLimiterMemory) => {
+export const createKeyedRateLimitMiddleware = (
+  customLimiter: RateLimiterLike,
+  options: {
+    policyId?: RateLimitPolicyId;
+    authenticatedOnly?: boolean;
+  } = {}
+) => {
+  const policyId = options.policyId ?? "perKey";
   return async (req: Request, res: Response, next: NextFunction) => {
-    const key = (req as any).apiKey?.id || req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const authenticatedKey = getAuthenticatedRateLimitKey(req);
+    if (!authenticatedKey && options.authenticatedOnly) {
+      next();
+      return;
+    }
+
+    const key = authenticatedKey ?? `ip:${getClientKey(req)}`;
     try {
       const rateLimiterRes = await customLimiter.consume(String(key));
-      res.setHeader("X-RateLimit-Limit", customLimiter.points);
-      res.setHeader("X-RateLimit-Remaining", rateLimiterRes.remainingPoints);
-      res.setHeader("X-RateLimit-Reset", new Date(Date.now() + rateLimiterRes.msBeforeNext).toISOString());
+      setRateLimitHeaders(res, customLimiter, rateLimiterRes, policyId);
       next();
     } catch (rejRes) {
-      if (rejRes instanceof RateLimiterRes) {
-        res.setHeader("X-RateLimit-Limit", customLimiter.points);
-        res.setHeader("X-RateLimit-Remaining", rejRes.remainingPoints);
-        res.setHeader("X-RateLimit-Reset", new Date(Date.now() + rejRes.msBeforeNext).toISOString());
+      if (isRateLimitRejection(rejRes)) {
+        setRateLimitHeaders(res, customLimiter, rejRes, policyId);
         res.setHeader("Retry-After", Math.ceil(rejRes.msBeforeNext / 1000));
         res.status(429).json({
           error: {
@@ -263,14 +372,22 @@ export const strictRateLimitMiddleware = createRateLimitMiddleware(strictRateLim
 /**
  * Per-API-key rate limit middleware — layer on top of the global IP limiter.
  */
-export const perKeyRateLimitMiddleware = createKeyedRateLimitMiddleware(perKeyRateLimiter);
+export const perKeyRateLimitMiddleware = createKeyedRateLimitMiddleware(perKeyRateLimiter, {
+  policyId: "perKey",
+  authenticatedOnly: true,
+});
 
 /**
  * Reconciliation-route keyed rate limit middleware.
  */
-export const reconciliationRateLimitMiddleware = createKeyedRateLimitMiddleware(reconciliationRateLimiter);
+export const reconciliationRateLimitMiddleware = createKeyedRateLimitMiddleware(
+  reconciliationRateLimiter,
+  { policyId: "reconciliation" }
+);
 
 /**
  * Export-route keyed rate limit middleware.
  */
-export const exportRateLimitMiddleware = createKeyedRateLimitMiddleware(exportRateLimiter);
+export const exportRateLimitMiddleware = createKeyedRateLimitMiddleware(exportRateLimiter, {
+  policyId: "export",
+});

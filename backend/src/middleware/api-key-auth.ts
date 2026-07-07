@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { apiKeyService } from '../services/api-key-service';
 import { hasRequiredScopes } from '../config/scopes';
 import { ApiKey } from '../models/api-key';
+import { perKeyRateLimitMiddleware } from './rate-limit';
 
 // Extend Express Request to include API key context
 declare global {
@@ -81,7 +82,7 @@ export async function apiKeyAuthMiddleware(
     const ipAddress = (req.ip || req.socket.remoteAddress) as string | undefined;
     apiKeyService.updateLastUsed(apiKey.id, req.path, ipAddress);
 
-    next();
+    perKeyRateLimitMiddleware(req, res, next);
   } catch (error) {
     console.error('[ApiKeyAuth] Authentication error:', error);
     res.status(500).json({
@@ -154,6 +155,8 @@ export async function optionalApiKeyAuth(
         req.apiKey = apiKey;
         const ipAddress = (req.ip || req.socket.remoteAddress) as string | undefined;
         apiKeyService.updateLastUsed(apiKey.id, req.path, ipAddress);
+        perKeyRateLimitMiddleware(req, res, next);
+        return;
       }
     }
   } catch (error) {

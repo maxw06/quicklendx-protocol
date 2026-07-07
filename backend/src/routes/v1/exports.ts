@@ -26,7 +26,7 @@ const router = Router();
  *       200:
  *         description: Export link generated
  */
-router.post("/generate", exportRateLimitMiddleware, optionalApiKeyAuth, requireUserAuth, requireSignature, exportController.requestExport);
+router.post("/generate", optionalApiKeyAuth, exportRateLimitMiddleware, requireUserAuth, requireSignature, exportController.requestExport);
 
 /**
  * @openapi

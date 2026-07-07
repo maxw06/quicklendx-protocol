@@ -8,8 +8,12 @@ import {
   exportRateLimiter,
   exportRateLimitMiddleware,
   createKeyedRateLimitMiddleware,
+  SlidingWindowRateLimiter,
+  getRateLimitPolicies,
 } from "../middleware/rate-limit";
 import { RateLimiterRes, RateLimiterMemory } from "rate-limiter-flexible";
+import { apiKeyAuthMiddleware, optionalApiKeyAuth } from "../middleware/api-key-auth";
+import { apiKeyService } from "../services/api-key-service";
 
 /**
  * Per-API-key and per-route rate limiting tests
@@ -18,10 +22,11 @@ describe("per-key rate limiting", () => {
   beforeEach(() => {
     perKeyRateLimiter.delete("key-1");
     perKeyRateLimiter.delete("key-2");
-    perKeyRateLimiter.delete("127.0.0.1");
+    perKeyRateLimiter.delete("api-key:key-1");
+    perKeyRateLimiter.delete("api-key:key-2");
   });
 
-  it("keys on apiKey.id when present", async () => {
+  it("keys on authenticated apiKey.id when present", async () => {
     const app = express();
     app.use((req, _res, next) => {
       (req as any).apiKey = { id: "key-1" };
@@ -36,17 +41,19 @@ describe("per-key rate limiting", () => {
     expect(res.headers).toHaveProperty("x-ratelimit-remaining");
   });
 
-  it("falls back to IP when apiKey is absent", async () => {
+  it("skips the per-key limiter when apiKey is absent", async () => {
     const app = express();
-    app.use((req, _res, next) => {
-      Object.defineProperty(req, "ip", { value: "127.0.0.1", configurable: true });
-      next();
-    });
     app.use(perKeyRateLimitMiddleware);
     app.get("/test", (_req, res) => res.json({ ok: true }));
 
+    const consumeSpy = jest.spyOn(perKeyRateLimiter, "consume");
     const res = await supertest(app).get("/test");
+
     expect(res.status).toBe(200);
+    expect(consumeSpy).not.toHaveBeenCalled();
+    expect(res.headers["x-ratelimit-limit"]).toBeUndefined();
+
+    consumeSpy.mockRestore();
   });
 
   it("separates buckets for different API keys", async () => {
@@ -119,30 +126,98 @@ describe("per-key rate limiting", () => {
     consumeSpy.mockRestore();
   });
 
-  it("falls back to X-Forwarded-For when no ip and no apiKey", async () => {
-    const app = express();
-    app.use((req, _res, next) => {
-      Object.defineProperty(req, "ip", { value: undefined, configurable: true });
-      next();
+  it("allows exactly the configured sliding-window limit and reopens as the window rolls", async () => {
+    let now = 1_000_000;
+    const limiter = new SlidingWindowRateLimiter({
+      points: 2,
+      duration: 1,
+      clock: () => now,
     });
-    app.use(perKeyRateLimitMiddleware);
-    app.get("/test", (_req, res) => res.json({ ok: true }));
 
-    const res = await supertest(app).get("/test").set("X-Forwarded-For", "10.0.0.1");
-    expect(res.status).toBe(200);
+    await expect(limiter.consume("api-key:key-1")).resolves.toMatchObject({
+      remainingPoints: 1,
+    });
+    await expect(limiter.consume("api-key:key-1")).resolves.toMatchObject({
+      remainingPoints: 0,
+    });
+    await expect(limiter.consume("api-key:key-1")).rejects.toMatchObject({
+      remainingPoints: 0,
+      msBeforeNext: 1000,
+    });
+
+    now += 999;
+    await expect(limiter.consume("api-key:key-1")).rejects.toMatchObject({
+      remainingPoints: 0,
+      msBeforeNext: 1,
+    });
+
+    now += 1;
+    await expect(limiter.consume("api-key:key-1")).resolves.toMatchObject({
+      remainingPoints: 1,
+    });
   });
 
-  it("falls back to 'unknown' when no ip, no apiKey, no forwarded-for", async () => {
+  it("applies per-key limiting after Bearer API key auth attaches a key id", async () => {
     const app = express();
-    app.use((req, _res, next) => {
-      Object.defineProperty(req, "ip", { value: undefined, configurable: true });
-      next();
-    });
-    app.use(perKeyRateLimitMiddleware);
-    app.get("/test", (_req, res) => res.json({ ok: true }));
+    app.use(apiKeyAuthMiddleware);
+    app.get("/protected", (_req, res) => res.json({ ok: true }));
 
-    const res = await supertest(app).get("/test");
+    const originalVerify = apiKeyService.verifyApiKey;
+    const originalUpdateLastUsed = apiKeyService.updateLastUsed;
+    (apiKeyService as any).verifyApiKey = async () => ({
+      id: "auth-key-id",
+      scopes: ["bid:create"],
+      created_by: "investor-1",
+    });
+    (apiKeyService as any).updateLastUsed = () => undefined;
+
+    const consumeSpy = jest.spyOn(perKeyRateLimiter, "consume");
+    consumeSpy.mockResolvedValueOnce({
+      remainingPoints: 59,
+      msBeforeNext: 60_000,
+      consumedPoints: 1,
+      isFirstInDuration: true,
+    });
+
+    try {
+      const res = await supertest(app)
+        .get("/protected")
+        .set("Authorization", "Bearer qlx_test_valid");
+
+      expect(res.status).toBe(200);
+      expect(consumeSpy).toHaveBeenCalledWith("api-key:auth-key-id");
+      expect(res.headers["x-ratelimit-policy"]).toBe("perKey");
+    } finally {
+      (apiKeyService as any).verifyApiKey = originalVerify;
+      (apiKeyService as any).updateLastUsed = originalUpdateLastUsed;
+      consumeSpy.mockRestore();
+    }
+  });
+
+  it("leaves anonymous optional auth traffic on the global limiter only", async () => {
+    const app = express();
+    app.use(optionalApiKeyAuth);
+    app.use(perKeyRateLimitMiddleware);
+    app.get("/optional", (_req, res) => res.json({ ok: true }));
+
+    const consumeSpy = jest.spyOn(perKeyRateLimiter, "consume");
+    const res = await supertest(app).get("/optional");
+
     expect(res.status).toBe(200);
+    expect(consumeSpy).not.toHaveBeenCalled();
+
+    consumeSpy.mockRestore();
+  });
+
+  it("surfaces per-key sliding-window policy metadata for the status endpoint", () => {
+    const policies = getRateLimitPolicies();
+
+    expect(policies.perKey).toMatchObject({
+      blockSeconds: 0,
+    });
+    expect(policies.perKey.headers).toEqual(
+      expect.arrayContaining(["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"])
+    );
   });
 });
 
