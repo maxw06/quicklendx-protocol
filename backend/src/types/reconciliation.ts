@@ -19,6 +19,13 @@ export interface BackfillResult {
   errors: string[];
 }
 
+export interface ReconciliationDriftSnapshot {
+  runAt: string;
+  checkedCount: number;
+  driftCount: number;
+  severity: Severity;
+}
+
 // ---------------------------------------------------------------------------
 // Drift-severity / alerting shared types
 // ---------------------------------------------------------------------------

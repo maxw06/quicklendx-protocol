@@ -2,6 +2,8 @@ import {
   DriftReport,
   DriftItem,
   BackfillResult,
+  ReconciliationDriftSnapshot,
+  Severity,
 } from "../types/reconciliation";
 import { Invoice } from "../types/contract";
 import { rpcClient } from "./rpcClient";
@@ -9,6 +11,30 @@ import { derivedTableStore } from "./replayService";
 import { MockDataProviders } from "./mockDataProviders";
 import { backfillService } from "./backfillService";
 import { withSpan } from "../lib/tracing";
+import { getPreparedStatement } from "../lib/database";
+
+const DEFAULT_DRIFT_TREND_LIMIT = 20;
+const MAX_DRIFT_TREND_LIMIT = 100;
+
+export const classifyReconciliationDriftSeverity = (
+  driftCount: number,
+): Severity => {
+  if (driftCount > 100) return Severity.HIGH;
+  if (driftCount >= 2) return Severity.MEDIUM;
+  return Severity.LOW;
+};
+
+const clampDriftTrendLimit = (limit: number = DEFAULT_DRIFT_TREND_LIMIT): number => {
+  if (!Number.isFinite(limit)) return DEFAULT_DRIFT_TREND_LIMIT;
+  return Math.min(MAX_DRIFT_TREND_LIMIT, Math.max(1, Math.floor(limit)));
+};
+
+const mapSnapshotRow = (row: any): ReconciliationDriftSnapshot => ({
+  runAt: row.run_at,
+  checkedCount: Number(row.checked_count),
+  driftCount: Number(row.drift_count),
+  severity: row.severity as Severity,
+});
 
 export class ReconciliationWorker {
   private static reports: DriftReport[] = [];
@@ -52,7 +78,7 @@ export class ReconciliationWorker {
               error: rpcErr instanceof Error ? rpcErr.message : String(rpcErr),
             } as any;
 
-            this.reports.push(report);
+            this.recordReport(report);
             return report;
           }
         }
@@ -86,7 +112,7 @@ export class ReconciliationWorker {
           drifts,
         };
 
-        this.reports.push(report);
+        this.recordReport(report);
         return report;
       } finally {
         this.isRunning = false;
@@ -126,11 +152,55 @@ export class ReconciliationWorker {
     );
   }
 
+  static getDriftTrend(limit: number = DEFAULT_DRIFT_TREND_LIMIT): ReconciliationDriftSnapshot[] {
+    return withSpan(
+      "reconciliation.getDriftTrend",
+      { limit },
+      () => {
+        const clampedLimit = clampDriftTrendLimit(limit);
+        const rows = getPreparedStatement(`
+          SELECT run_at, checked_count, drift_count, severity
+          FROM reconciliation_snapshots
+          ORDER BY run_at DESC, id DESC
+          LIMIT ?
+        `).all(clampedLimit) as any[];
+
+        return rows.map(mapSnapshotRow);
+      },
+    );
+  }
+
   static isReconciliationRunning(): boolean {
     return withSpan(
       "reconciliation.isReconciliationRunning",
       {},
       () => this.isRunning,
     );
+  }
+
+  private static recordReport(report: DriftReport): void {
+    this.reports.push(report);
+    this.persistDriftSnapshot(report);
+  }
+
+  private static persistDriftSnapshot(report: DriftReport): void {
+    try {
+      getPreparedStatement(`
+        INSERT INTO reconciliation_snapshots (
+          run_at,
+          checked_count,
+          drift_count,
+          severity
+        )
+        VALUES (?, ?, ?, ?)
+      `).run(
+        new Date(report.timestamp * 1000).toISOString(),
+        report.totalRecordsChecked,
+        report.driftCount,
+        classifyReconciliationDriftSeverity(report.driftCount),
+      );
+    } catch (err) {
+      console.error("Failed to persist reconciliation drift snapshot:", err);
+    }
   }
 }
